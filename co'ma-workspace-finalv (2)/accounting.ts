@@ -131,7 +131,7 @@ export const calculateCustomerTransaction = (
         settledDebt,
         finalCredit,
         finalDebt,
-        isFullyPaid: finalDebt === 0 && (totalDue <= (paidAmount + appliedCredit))
+        isFullyPaid: finalDebt === 0
     };
 };
 
@@ -436,6 +436,7 @@ export const calcInventoryPreview = (
     const netBankInPlace = totalBankRevenue - totalBankExpenses - totalBankPurchases - bankDebts - partnerBankRepaymentsTotal + totalTransferred;
 
     // Profit Calculation (Accrual-ish for Overhead)
+    // Fixed Expenses: Allocate daily share based on actual days in month
     let allocatedFixedExpenses = 0;
     const fixedBreakdownMap = new Map<string, any>();
     let d = new Date(dStart);
@@ -443,9 +444,9 @@ export const calcInventoryPreview = (
     let loops = 0;
     while (d <= dEnd && loops < 366) {
         const dateKey = d.toISOString().split('T')[0];
-        const dim = getDaysInMonth(dateKey);
+        const daysInCurrentMonth = getDaysInMonth(dateKey);
         fixedExpenses.forEach(fe => {
-            const dailyShare = (fe.amount || 0) / dim;
+            const dailyShare = (fe.amount || 0) / daysInCurrentMonth;
             allocatedFixedExpenses += dailyShare;
             const existing = fixedBreakdownMap.get(fe.id) || { amount: 0, days: 0, monthlyAmount: fe.amount };
             fixedBreakdownMap.set(fe.id, { amount: existing.amount + dailyShare, days: existing.days + 1, monthlyAmount: fe.amount });
@@ -724,9 +725,3 @@ export const rebuildAllArchives = (
 export const auditSystem = (records: Record[], cycles: DayCycle[]) => {
     return { consistent: true, messages: [] };
 };
-
-const PARTNERS = [
-    { id: 'abu_khaled', name: 'أبو خالد' },
-    { id: 'khaled', name: 'خالد' },
-    { id: 'abdullah', name: 'عبد الله' }
-];

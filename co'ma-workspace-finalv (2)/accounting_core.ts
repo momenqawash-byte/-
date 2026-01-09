@@ -19,11 +19,12 @@ export const getLedgerBalance = (ledger: LedgerEntry[], channel: FinancialChanne
         if (accountId && entry.accountId !== accountId) return acc;
 
         // CRITICAL FIX: Ignore Partner-Funded Purchases from Treasury Totals
-        // Even if recorded as 'in' to increase partner entitlement, it shouldn't increase the physical cash/bank total.
-        const isPartnerPurchase = entry.type === TransactionType.PARTNER_DEPOSIT && 
-                                 (entry.description.includes('شراء') || entry.description.includes('بضاعة'));
-        
-        if (isPartnerPurchase) return acc;
+        // Only ignore PARTNER_DEPOSIT entries that are purchase-related (not actual money in)
+        const isPartnerPurchaseDeposit = entry.type === TransactionType.PARTNER_DEPOSIT &&
+                                         entry.direction === 'in' &&
+                                         (entry.description.includes('شراء') || entry.description.includes('بضاعة'));
+
+        if (isPartnerPurchaseDeposit) return acc;
         
         if (entry.direction === 'in') {
             if (channel === 'bank' && entry.transferStatus && entry.transferStatus !== 'confirmed') {
@@ -101,11 +102,12 @@ export const getLedgerStatsForPeriod = (ledger: LedgerEntry[], startDate: string
     // FIX: Calculate net cash flow for the period to fix "Property 'netCashFlow' does not exist" error in Summary.tsx
     const netCashFlow = periodEntries.reduce((acc, entry) => {
         if (entry.channel !== 'cash') return acc;
-        
-        const isPartnerPurchase = entry.type === TransactionType.PARTNER_DEPOSIT && 
-                                 (entry.description.includes('شراء') || entry.description.includes('بضاعة'));
-        if (isPartnerPurchase) return acc;
-        
+
+        const isPartnerPurchaseDeposit = entry.type === TransactionType.PARTNER_DEPOSIT &&
+                                         entry.direction === 'in' &&
+                                         (entry.description.includes('شراء') || entry.description.includes('بضاعة'));
+        if (isPartnerPurchaseDeposit) return acc;
+
         if (entry.direction === 'in') return acc + (entry.amount || 0);
         if (entry.direction === 'out') return acc - (entry.amount || 0);
         return acc;
@@ -303,7 +305,9 @@ export const processAutoSavings = (
             amountToDeduct = daysDiff * plan.amount;
             description = `ادخار يومي تلقائي (${daysDiff} أيام)`;
         } else if (plan.type === 'monthly_payment') {
-            const dailyRate = plan.amount / 30;
+            const monthKey = inventoryDate.slice(0, 7);
+            const daysInMonth = getDaysInMonth(inventoryDate);
+            const dailyRate = plan.amount / daysInMonth;
             amountToDeduct = Math.round(dailyRate * daysDiff * 100) / 100;
             description = `التزام شهري تلقائي (${daysDiff} أيام)`;
         }
@@ -455,8 +459,9 @@ export const calcLedgerInventory = (
     const liquidated = periodEntries
         .filter(e => e.type === TransactionType.LIQUIDATION_TO_APP && e.direction === 'out' && e.channel === 'cash')
         .reduce((s, e) => s + (e.amount || 0), 0);
-    
-    const netCashInPlace = (cashRevenuePaid + cashDebtCollected) - cashExpensesPhysical - liquidated - totalLoanRepayments - totalSavings;
+
+    // netCashInPlace: Revenue - Physical Expenses (already includes loan repayments) - Transfers
+    const netCashInPlace = (cashRevenuePaid + cashDebtCollected) - cashExpensesPhysical - liquidated;
     const netBankInPlace = (bankRevenuePaid + bankDebtCollected) - bankExpensesPhysical + liquidated;
 
     const totalDebtRevenue = periodEntries.filter(e => e.type === TransactionType.DEBT_CREATE).reduce((s, e) => s + (e.amount || 0), 0);
@@ -471,28 +476,36 @@ export const calcLedgerInventory = (
 
     const partners = GLOBAL_PARTNERS.map(p => {
         const baseShare = Math.max(0, netProfitPaid * (p.percent / 100));
-        
-        const cashShareAllocated = baseShare * cashRatio;
-        const bankShareAllocated = baseShare * bankRatio;
 
         const myCashPurchases = periodEntries.filter(e => e.partnerId === p.id && e.channel === 'cash' && (e.type === TransactionType.PARTNER_DEPOSIT) && (e.description.includes('شراء') || e.description.includes('بضاعة'))).reduce((s, e) => s + (e.amount || 0), 0);
         const myBankPurchases = periodEntries.filter(e => e.partnerId === p.id && e.channel === 'bank' && (e.type === TransactionType.PARTNER_DEPOSIT) && (e.description.includes('شراء') || e.description.includes('بضاعة'))).reduce((s, e) => s + (e.amount || 0), 0);
-        
+
         const myCashWithdrawals = periodEntries.filter(e => e.partnerId === p.id && e.channel === 'cash' && e.type === TransactionType.PARTNER_WITHDRAWAL).reduce((s, e) => s + (e.amount || 0), 0);
         const myBankWithdrawals = periodEntries.filter(e => e.partnerId === p.id && e.channel === 'bank' && e.type === TransactionType.PARTNER_WITHDRAWAL).reduce((s, e) => s + (e.amount || 0), 0);
-        
+
+        // Calculate operating net including loan repayments and withdrawals for accurate cash/bank ratio
+        const opsNetCash = netCashInPlace + myCashPurchases + myCashWithdrawals;
+        const opsNetBank = netBankInPlace + myBankPurchases + myBankWithdrawals;
+        const totalOpsNet = opsNetCash + opsNetBank;
+
+        const accurateCashRatio = totalOpsNet > 0 ? Math.max(0, opsNetCash) / totalOpsNet : 0.5;
+        const accurateBankRatio = 1 - accurateCashRatio;
+
+        const cashShareAllocated = baseShare * accurateCashRatio;
+        const bankShareAllocated = baseShare * accurateBankRatio;
+
         const finalPayoutCash = cashShareAllocated + myCashPurchases - myCashWithdrawals;
         const finalPayoutBank = bankShareAllocated + myBankPurchases - myBankWithdrawals;
 
         return {
-            name: p.name, sharePercent: p.percent / 100, baseShare, 
+            name: p.name, sharePercent: p.percent / 100, baseShare,
             cashShareAvailable: cashShareAllocated, bankShareAvailable: bankShareAllocated,
-            purchasesReimbursement: myCashPurchases + myBankPurchases, 
-            loanRepaymentCash: 0, loanRepaymentBank: 0, 
+            purchasesReimbursement: myCashPurchases + myBankPurchases,
+            loanRepaymentCash: 0, loanRepaymentBank: 0,
             placeDebtDeducted: myCashWithdrawals + myBankWithdrawals,
-            finalPayoutCash, 
+            finalPayoutCash,
             finalPayoutBank,
-            finalPayoutTotal: finalPayoutCash + finalPayoutBank, 
+            finalPayoutTotal: finalPayoutCash + finalPayoutBank,
             remainingDebt: 0
         };
     });
